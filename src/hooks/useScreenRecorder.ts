@@ -1129,18 +1129,47 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 		const platform = await window.electronAPI.getPlatform();
 		hideEditorOverlayCursorByDefault.current = false;
 		const existingSource = await window.electronAPI.getSelectedSource();
+		// When nothing has been picked on Linux, resolve a real screen from
+		// desktopCapturer instead of assuming the portal. Defaulting to the
+		// sentinel unconditionally meant X11 sessions — which never choose it
+		// in getScreenSourceIdForDisplay — still handed "screen:linux-portal"
+		// to getUserMedia as a chromeMediaSourceId, and Chromium rejected it
+		// with INVALID_STATE ("Failed to start recording: Invalid state").
+		// The sentinel is only a valid last resort when enumeration yields
+		// nothing, which is the Wayland case the portal route exists for.
+		const resolveDefaultLinuxSource = async () => {
+			try {
+				const liveSources = await window.electronAPI.getSources({
+					types: ["screen"],
+					thumbnailSize: { width: 1, height: 1 },
+					fetchWindowIcons: false,
+				});
+				const primary = liveSources?.[0];
+				if (primary?.id) {
+					return {
+						...LINUX_PORTAL_SOURCE,
+						id: primary.id,
+						name: primary.name ?? "Screen",
+					};
+				}
+			} catch (err) {
+				console.warn("Failed to enumerate Linux screen sources:", err);
+			}
+			return LINUX_PORTAL_SOURCE;
+		};
+
 		const selectedSource =
-			existingSource ?? (platform === "linux" ? LINUX_PORTAL_SOURCE : null);
+			existingSource ?? (platform === "linux" ? await resolveDefaultLinuxSource() : null);
 		if (!selectedSource) {
 			alert("Please select a source to record");
 			return null;
 		}
 
-		if (!existingSource && selectedSource.id === "screen:linux-portal") {
+		if (!existingSource && platform === "linux") {
 			try {
 				await window.electronAPI.selectSource(selectedSource);
 			} catch (err) {
-				console.warn("Failed to persist Linux portal sentinel source:", err);
+				console.warn("Failed to persist auto-selected Linux source:", err);
 			}
 		}
 
@@ -1961,20 +1990,10 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 			let videoTrack: MediaStreamTrack | undefined;
 			let systemAudioIncluded = false;
 			const mediaDevices = navigator.mediaDevices as DesktopCaptureMediaDevices;
-			// On Linux, prefer the xdg-desktop-portal route for every screen
-			// capture, not just when the sentinel source id was selected.
-			// Detecting Wayland from the main process environment proved
-			// unreliable, and the two routes fail with the same
-			// NotReadableError ("Could not start video source"), so the session
-			// type cannot be inferred from the failure either. Attempting the
-			// portal first and falling back to the legacy desktopCapturer path
-			// works on both Wayland and X11 without needing to know which is in
-			// use. Window captures keep the legacy path: the portal cannot be
-			// pointed at a pre-chosen window.
-			const isLinuxScreenCapture =
-				platform === "linux" && !selectedSource.id?.startsWith("window:");
-			const useLinuxPortal =
-				selectedSource.id === "screen:linux-portal" || isLinuxScreenCapture;
+			// Only the portal sentinel takes the getDisplayMedia route. Forcing
+			// it for every Linux screen capture sent X11 sessions through a
+			// portal they have no backend for.
+			const useLinuxPortal = selectedSource.id === "screen:linux-portal";
 			console.info(
 				`[capture] platform=${platform} sourceId=${selectedSource.id} route=${
 					useLinuxPortal ? "portal(getDisplayMedia)" : "legacy(getUserMedia)"
@@ -1995,41 +2014,19 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 
 			if (wantsAudioCapture) {
 				let screenMediaStream: MediaStream;
-				const acquireLinuxPortalStream = async (withAudio: boolean) => {
-					try {
-						return await mediaDevices.getDisplayMedia({
-							audio: withAudio,
-							video: {
-								displaySurface: "monitor",
-								width: { ideal: TARGET_WIDTH, max: TARGET_WIDTH },
-								height: { ideal: TARGET_HEIGHT, max: TARGET_HEIGHT },
-								frameRate: { ideal: TARGET_FRAME_RATE, max: TARGET_FRAME_RATE },
-								cursor: browserCursorPolicy.streamCursor,
-							},
-							selfBrowserSurface: "exclude",
-							surfaceSwitching: "exclude",
-						});
-					} catch (portalError) {
-						// An X11 session has no portal to answer this, and a
-						// broken portal backend fails the same way. Retry on the
-						// legacy desktopCapturer route before giving up.
-						console.warn(
-							"[capture] portal route failed, retrying via legacy getUserMedia:",
-							portalError,
-						);
-						return await mediaDevices.getUserMedia({
-							audio: withAudio
-								? {
-										mandatory: {
-											chromeMediaSource: CHROME_MEDIA_SOURCE,
-											chromeMediaSourceId: browserCaptureSource.id,
-										},
-									}
-								: false,
-							video: browserScreenVideoConstraints,
-						});
-					}
-				};
+				const acquireLinuxPortalStream = (withAudio: boolean) =>
+					mediaDevices.getDisplayMedia({
+						audio: withAudio,
+						video: {
+							displaySurface: "monitor",
+							width: { ideal: TARGET_WIDTH, max: TARGET_WIDTH },
+							height: { ideal: TARGET_HEIGHT, max: TARGET_HEIGHT },
+							frameRate: { ideal: TARGET_FRAME_RATE, max: TARGET_FRAME_RATE },
+							cursor: browserCursorPolicy.streamCursor,
+						},
+						selfBrowserSurface: "exclude",
+						surfaceSwitching: "exclude",
+					});
 
 				if (systemAudioEnabled) {
 					try {
@@ -2126,16 +2123,8 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 					stream.current.addTrack(micAudioTrack);
 				}
 			} else {
-				const acquireLegacyVideoOnlyStream = () =>
-					mediaDevices.getUserMedia({
-						audio: false,
-						video: browserScreenVideoConstraints,
-					});
-
-				let mediaStream: MediaStream;
-				if (useLinuxPortal) {
-					try {
-						mediaStream = await mediaDevices.getDisplayMedia({
+				const mediaStream = useLinuxPortal
+					? await mediaDevices.getDisplayMedia({
 							audio: false,
 							video: {
 								displaySurface: selectedSource.id?.startsWith("window:")
@@ -2148,17 +2137,11 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 							},
 							selfBrowserSurface: "exclude",
 							surfaceSwitching: "exclude",
+						})
+					: await mediaDevices.getUserMedia({
+							audio: false,
+							video: browserScreenVideoConstraints,
 						});
-					} catch (portalError) {
-						console.warn(
-							"[capture] portal route failed, retrying via legacy getUserMedia:",
-							portalError,
-						);
-						mediaStream = await acquireLegacyVideoOnlyStream();
-					}
-				} else {
-					mediaStream = await acquireLegacyVideoOnlyStream();
-				}
 
 				stream.current = mediaStream;
 				videoTrack = mediaStream.getVideoTracks()[0];
