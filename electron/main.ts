@@ -1100,6 +1100,17 @@ app.whenReady().then(async () => {
 			// pre-selected (e.g. fresh session where the renderer skipped the
 			// source picker entirely). This avoids calling getSources() which
 			// would itself trigger an extra portal dialog.
+			if (process.platform === "linux") {
+				// Surfaced so a failing capture report carries the session type.
+				// Wayland and X11 fail with the same NotReadableError, so the
+				// error alone never identified which route was in play.
+				console.info(
+					`[capture] linux session XDG_SESSION_TYPE=${process.env.XDG_SESSION_TYPE ?? "(unset)"}` +
+						` WAYLAND_DISPLAY=${process.env.WAYLAND_DISPLAY ?? "(unset)"}` +
+						` XDG_CURRENT_DESKTOP=${process.env.XDG_CURRENT_DESKTOP ?? "(unset)"}` +
+						` sourceId=${sourceId ?? "(none)"}`,
+				);
+			}
 			const isLinuxPortalSentinel =
 				process.platform === "linux" && (sourceId === "screen:linux-portal" || !sourceId);
 			if (isLinuxPortalSentinel) {
